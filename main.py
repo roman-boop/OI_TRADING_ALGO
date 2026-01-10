@@ -18,7 +18,7 @@ users_lock = threading.Lock()
 VOL_PERIOD = 60
 USERS_FILE = Path("users.json")
 LOG_FILE = Path("bot.log")
-TELEGRAM_TOKEN = "8383639490:AAF8NSmeDxVBNRMjrSKyNf3rGJ5yHlfE3EA"
+TELEGRAM_TOKEN = ""
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # =====================================================
@@ -766,4 +766,5 @@ def main():
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
+
     main()
