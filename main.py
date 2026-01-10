@@ -56,7 +56,6 @@ def save_users(users_dict):
 users = load_users()
 
 BINANCE_FAPI_URL = "https://fapi.binance.com"
-TELEGRAM_TOKEN = "8383639490:AAF8NSmeDxVBNRMjrSKyNf3rGJ5yHlfE3EA"
 
 CHECK_INTERVAL_MIN = 1
 
@@ -768,3 +767,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
