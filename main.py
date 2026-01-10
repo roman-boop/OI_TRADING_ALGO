@@ -1,72 +1,97 @@
-# main.py (updated)
-
 import time
 import requests
 import json
+import logging
+import concurrent.futures
 from datetime import datetime, timedelta
-from collections import defaultdict
 from pathlib import Path
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, Filters
-
+import threading
+import asyncio
 from bingx_client import BingxClient
+
+users_lock = threading.Lock()
+# =====================================================
+# ================== CONFIG ===========================
+# =====================================================
+VOL_PERIOD = 60
+USERS_FILE = Path("users.json")
+LOG_FILE = Path("bot.log")
+TELEGRAM_TOKEN = "8383639490:AAF8NSmeDxVBNRMjrSKyNf3rGJ5yHlfE3EA"
+bot = Bot(token=TELEGRAM_TOKEN)
 
 # =====================================================
 # ================== CONFIG ===========================
 # =====================================================
-Vol_period = 60
-USERS_FILE = Path("users.json")
+trade_lock = threading.Lock()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 def load_users():
-    if USERS_FILE.exists():
-        return json.loads(USERS_FILE.read_text())
-    return {}
+    #if USERS_FILE.exists():
+        #try:
+            #return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        #except json.JSONDecodeError:
+           # logger.error("Corrupted users.json, starting fresh")
+            #return {}
+    #return {}
+    with users_lock:
+        if USERS_FILE.exists():
+            try:
+                return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                logger.error("Corrupted users.json, starting fresh")
+                return {}
+        return {}
 
-def save_users(users):
-    USERS_FILE.write_text(json.dumps(users, indent=4))
+def save_users(users_dict):
+    USERS_FILE.write_text(json.dumps(users_dict, indent=4, ensure_ascii=False), encoding="utf-8")
 
 users = load_users()
 
 BINANCE_FAPI_URL = "https://fapi.binance.com"
-
-TELEGRAM_TOKEN = ""
+TELEGRAM_TOKEN = "8383639490:AAF8NSmeDxVBNRMjrSKyNf3rGJ5yHlfE3EA"
 
 CHECK_INTERVAL_MIN = 1
 
-OI_4H_THRESHOLD = 10.0     # %
-OI_24H_THRESHOLD = 16.0    # % 
+OI_4H_THRESHOLD = 10.0
+OI_24H_THRESHOLD = 16.0
 
-PRICE_OI_RATIO = 0.5     # price_growth <= oi_growth * ratio
-MIN_OI_USDT = 5_000_000  # фильтр мусора
 
-SIGNAL_COOLDOWN_HOURS = 3  # защита от спама
-
+MIN_OI_USDT = 5_000_00
+SIGNAL_COOLDOWN_HOURS = 3
 REQUEST_TIMEOUT = 10
-
-# =====================================================
-# ================== INIT =============================
-# =====================================================
-
-bot = Bot(token=TELEGRAM_TOKEN)
 
 # =====================================================
 # ================== UTILS ============================
 # =====================================================
 
 def pct(now, past):
-    if past == 0:
-        return 0.0
-    return (now - past) / past * 100.0
+    return 0.0 if past == 0 else (now - past) / past * 100.0
 
-def send_alert(chat_id, text):
+def send_alert(chat_id, text, parse_mode="HTML"):
     try:
-        bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML"
-        )
+        bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+
     except Exception as e:
-        print(f"Telegram error {chat_id}: {e}")
+        error_text = str(e)
+        logger.error(f"Telegram error {chat_id}: {error_text}")
+
+        # 🚫 Пользователь заблокировал бота → удаляем из базы
+        if "Forbidden" in error_text and "blocked by the user" in error_text:
+            users = load_users()
+            chat_id_str = str(chat_id)
+
+            if chat_id_str in users:
+                del users[chat_id_str]
+                save_users(users)
+                logger.info(f"User {chat_id} removed from users.json (bot blocked)")
 
 def binance_get(endpoint, params=None):
     url = BINANCE_FAPI_URL + endpoint
@@ -89,43 +114,42 @@ def get_symbols():
     ]
 
 def get_oi_hist(symbol, limit):
-    return binance_get(
-        "/futures/data/openInterestHist",
-        {
-            "symbol": symbol,
-            "period": "5m",
-            "limit": limit
-        }
-    )
+    return binance_get("/futures/data/openInterestHist", {"symbol": symbol, "period": "5m", "limit": limit})
 
 def get_klines(symbol, limit):
-    return binance_get(
-        "/fapi/v1/klines",
-        {
-            "symbol": symbol,
-            "interval": "5m",
-            "limit": limit
-        }
-    )
+    return binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": limit})
 
 # =====================================================
 # ================== CORE LOGIC =======================
 # =====================================================
+def is_in_cooldown(user_data: dict, symbol: str) -> bool:
+    last_signals = user_data.get("last_signal_time", {})
+    ts = last_signals.get(symbol)
+
+    if not ts:
+        return False
+
+    try:
+        last_dt = datetime.fromisoformat(ts)
+    except Exception:
+        return False
+
+    return datetime.utcnow() - last_dt < timedelta(hours=SIGNAL_COOLDOWN_HOURS)
 
 def check_symbol(symbol):
     try:
         oi_4h = get_oi_hist(symbol, 48)
         oi_24h = get_oi_hist(symbol, 288)
-
         if len(oi_24h) < 288:
-            return
+            print('lenoi error')
+            return None
 
         oi_now = float(oi_4h[-1]["sumOpenInterestValue"])
         oi_4h_ago = float(oi_4h[0]["sumOpenInterestValue"])
         oi_24h_ago = float(oi_24h[0]["sumOpenInterestValue"])
-        
         if oi_now < MIN_OI_USDT:
-            return
+            print('oi min error')
+            return None
 
         oi_growth_4h = pct(oi_now, oi_4h_ago)
         oi_growth_24h = pct(oi_now, oi_24h_ago)
@@ -140,131 +164,248 @@ def check_symbol(symbol):
         price_growth_4h = pct(price_now, price_4h_ago)
         price_growth_24h = pct(price_now, price_24h_ago)
 
-        signal_4h = (
-            oi_growth_4h >= OI_4H_THRESHOLD and
-            price_growth_4h <= oi_growth_4h * PRICE_OI_RATIO
-        )
+        
 
-        signal_24h = (
-            oi_growth_24h >= OI_24H_THRESHOLD and
-            price_growth_24h <= oi_growth_24h * PRICE_OI_RATIO
-        )
-
-        if not (signal_4h or signal_24h):
-            return
-
-        period = "4h" if signal_4h else "24h"
-
-        # Process for each user
+        # Обработка пользователей (синхронно, как в старом коде)
+        users = load_users()  # Загружаем свежие данные
         for chat_id_str, user_data in list(users.items()):
+            
+            price_oi_ratio = user_data.get("price_oi_ratio", 0.5)
+            allow_4h = user_data.get("signals_4h_enabled", True)
+            allow_24h = user_data.get("signals_24h_enabled", True)
+            
+            signal_4h = oi_growth_4h >= OI_4H_THRESHOLD and price_growth_4h <= oi_growth_4h * price_oi_ratio and allow_4h
+            signal_24h = oi_growth_24h >= OI_24H_THRESHOLD and price_growth_24h <= oi_growth_24h * price_oi_ratio and allow_24h
+
+            if not (signal_4h or signal_24h):
+                continue
+
+
+
+            period = "4h" if signal_4h else "24h"
+
+            signal_data = {
+                "symbol": symbol,
+                "period": period,
+                "oi_growth_4h": oi_growth_4h,
+                "oi_growth_24h": oi_growth_24h,
+                "price_growth_4h": price_growth_4h,
+                "price_growth_24h": price_growth_24h,
+                "price_now": price_now,
+                "oi_now": oi_now
+            }
+        
+        
             chat_id = int(chat_id_str)
+            #send_alert(chat_id, generate_alert_text(signal_data))
+
             if not user_data.get("trading_enabled", False):
-                # Still send alert if subscribed, even if trading disabled
-                send_alert(chat_id, generate_alert_text(symbol, period, oi_growth_4h, oi_growth_24h, price_growth_4h, price_growth_24h, price_now, oi_now))
+                print(chat_id, 'trading not enabled')
                 continue
 
-            last_signals = user_data.get("last_signal_time", {})
-            if symbol in last_signals and datetime.utcnow() - datetime.fromisoformat(last_signals[symbol]) < timedelta(hours=SIGNAL_COOLDOWN_HOURS):
+         
+
+           
+          
+
+            if symbol in user_data.get("blacklist", []):
+                print('blacklist', chat_id, symbol)
                 continue
 
-            # Update cooldown
-            last_signals[symbol] = datetime.utcnow().isoformat()
-            user_data["last_signal_time"] = last_signals
-            save_users(users)
+            with trade_lock:                      # ← ГЛАВНАЯ ФИКСАЦИЯ
+                users = load_users()
+                user_data = users.get(chat_id_str)
 
-            # Send alert
-            send_alert(chat_id, generate_alert_text(symbol, period, oi_growth_4h, oi_growth_24h, price_growth_4h, price_growth_24h, price_now, oi_now))
+                if not user_data:
+                    continue
 
-            # Open trade
-            try:
-                api_key = user_data["api_key"]
-                api_secret = user_data["api_secret"]
-                testnet = user_data.get("testnet", False)
-                leverage = user_data.get("leverage", 10)
-                margin_usdt = user_data.get("margin_usdt", 50)
-                stop_loss_pct = user_data.get("stop_loss_pct", 2.0)
-                take_profit_pct = user_data.get("take_profit_pct", 4.0)
-                trailing_enabled = user_data.get("trailing_enabled", False)
-                trailing_activation_pct = user_data.get("trailing_activation_pct", 1.5)
-                trailing_rate_pct = round(user_data.get("trailing_rate_pct", 2) / 100, 3)
+                # cooldown check
+                if is_in_cooldown(user_data, symbol):
+                    logger.info(f"{chat_id_str} cooldown active for {symbol}")
+                    continue
 
-                bx = BingxClient(api_key, api_secret, testnet=testnet)
-                if chat_id != 949808523:
-                # Set leverage if needed (assuming client has method, add if not)
-                    bx.set_leverage(symbol, 'long',leverage)  # Add this method if necessary
-
-                s = symbol.replace('USDT', '-USDT')
-                qty = (margin_usdt * leverage) / price_now
-
-                stop_price = price_now * (1 - stop_loss_pct / 100)
-                tp_price = price_now * (1 + take_profit_pct / 100)
-
-                precision = bx.count_decimal_places(price_now)
-                stop_price = round(stop_price, precision)
-                tp_price = round(tp_price, precision)
-                qty = round(qty, 0 if precision < 2 else 1)  # Adjust as per your logic
-                pos_side_BOTH = True if chat_id == 949808523 else False
+                # blacklist
                 if symbol in user_data.get("blacklist", []):
                     continue
 
-                # === VOLUME FILTER ===
-                if user_data.get("volume_filter_enabled", False):
-                    multiplier = user_data.get("volume_multiplier", 2.0)
-                    if not check_volume_filter(symbol, multiplier):
-                        continue
-                    
-                resp = bx.place_market_order('long', qty, s, stop_price, tp_price, pos_side_BOTH)
-                print(f"Order placed for {chat_id} on {symbol}: {resp}")
+                # 🔐 СТАВИМ COOLDOWN СРАЗУ
+                last_signals = user_data.setdefault("last_signal_time", {})
+                last_signals[symbol] = datetime.utcnow().isoformat()
 
-                if trailing_enabled:
-                    activation_price = price_now * (1 + trailing_activation_pct / 100)
-                    resp_trail = bx.set_trailing(s, 'long', qty, activation_price, trailing_rate_pct)
-                    print(f"Trailing set for {chat_id} on {symbol}: {resp_trail}")
+                save_users(users)
 
-            except Exception as e:
-                print(f"Trade error for {chat_id} on {symbol}: {e}")
-                send_alert(chat_id, f"Ошибка открытия сделки на {symbol}: {str(e)}")
+            print("opening", symbol, chat_id_str)
+            concurrent.futures.ThreadPoolExecutor().submit(open_trade_for_user, chat_id_str, signal_data)
+            
 
     except Exception as e:
-        print(f"{symbol}: {e}")
+        logger.error(f"Error checking {symbol}: {e}")
 
-def generate_alert_text(symbol, period, oi_growth_4h, oi_growth_24h, price_growth_4h, price_growth_24h, price_now, oi_now):
+def generate_alert_text(signal):
     return (
-        f"<b>${symbol.replace('USDT', '')}</b>\n"
+        f"<b>${signal['symbol'].replace('USDT', '')}</b>\n"
         f"🚨 <b>OI ALERT</b>\n"
-        f"⏱ Период: {period}\n\n"
-        f"OI 4h: {oi_growth_4h:.1f}%\n"
-        f"OI 24h: {oi_growth_24h:.1f}%\n\n"
-        f"Цена 4h: {price_growth_4h:.1f}%\n"
-        f"Цена 24h: {price_growth_24h:.1f}%\n\n"
-        f"Текущая цена: {price_now:.4f}\n"
-        f"OI: {oi_now/1e6:.1f}M USDT\n\n"
+        f"⏱ Период: {signal['period']}\n\n"
+        f"OI 4h: {signal['oi_growth_4h']:.1f}%\n"
+        f"OI 24h: {signal['oi_growth_24h']:.1f}%\n\n"
+        f"Цена 4h: {signal['price_growth_4h']:.1f}%\n"
+        f"Цена 24h: {signal['price_growth_24h']:.1f}%\n\n"
+        f"Текущая цена: {signal['price_now']:.4f}\n"
+        f"OI: {signal['oi_now']/1e6:.1f}M USDT\n\n"
         f"<i>OI растёт быстрее цены → возможное накопление</i>"
     )
+
+def check_volume_filter(symbol, multiplier):
+    klines = get_klines(symbol, VOL_PERIOD)
+    if len(klines) < VOL_PERIOD:
+        return False
+    volumes = [float(k[5]) for k in klines[:-1]]
+    avg_volume = sum(volumes) / len(volumes)
+    return float(klines[-1][5]) >= avg_volume * multiplier
+
+def open_trade_for_user(chat_id_str, signal):
+    chat_id = int(chat_id_str)
+    user_data = users.get(chat_id_str)
+    if not user_data:
+        print('not user data')
+        return
+
+    symbol = signal["symbol"]
+   
+
+    if symbol in user_data.get("blacklist", []):
+        logger.info(f"Skipped {symbol} for {chat_id} — in blacklist")
+        return
+
+    try:
+        bx = BingxClient(
+            user_data["api_key"],
+            user_data["api_secret"],
+            testnet=user_data.get("testnet", False)
+        )
+        price_now = bx.get_mark_price(symbol.replace('USDT', '-USDT'))
+        if price_now is None:
+            time.sleep(0.05)
+            price_now = bx.get_mark_price(bx._to_bingx_symbol(symbol))
+
+        leverage_responce = bx.set_leverage(symbol, 'LONG', user_data.get("leverage", 10))
+        if leverage_responce.get('code') != 0:
+            leverage_responce = bx.set_leverage(symbol, 'LONG', user_data.get("leverage", 10), one_way_mode = True)
+            
+            
+        s = symbol.replace('USDT', '-USDT')
+        qty = (user_data.get("margin_usdt", 50) * user_data.get("leverage", 10)) / price_now
+
+        stop_price = price_now * (1 - (user_data.get("stop_loss_pct", 2.0) / 100))
+        precision = bx.count_decimal_places(price_now)
+        stop_price = round(stop_price, precision)
+
+        tp_prices = [
+            round(price_now * (1 + p / 100), precision)
+            for p in user_data.get("take_profit_pcts", [4.0, 6.0])
+        ]
+
+
+        qty = round(qty, 0 if precision > 2 else 1)
+
+        if user_data.get("volume_filter_enabled", False):
+            if not check_volume_filter(symbol, user_data.get("volume_multiplier", 2.0)):
+                logger.info(f"Volume filter blocked {symbol} for {chat_id}")
+                return
+            
+            
+        one_way_mode = False
+        
+        resp = bx.place_market_order('long', qty, s, stop=stop_price, pos_side_BOTH=False)
+        resp = json.loads(resp) if isinstance(resp, str) else resp  # ← ЭТО САМОЕ ВАЖНОЕ!
+        if resp.get('code') == 109400:
+            one_way_mode = True
+            resp = bx.place_market_order('long', qty, s, stop=stop_price, pos_side_BOTH=one_way_mode)  
+            
+        elif resp.get('code') == 109425:
+            print('symbol does not exists')
+            return
+        elif resp.get('code') != 0:
+            raise ValueError(f"Order failed: {resp.get('msg')}")
+
+        # Проверка позиции
+        positions = bx.get_positions()
+        pos = next((p for p in positions if p['symbol'] == s), None)
+        if not pos or abs(float(pos.get('positionAmt', 0))) < qty * 0.9:
+            bx.place_market_order('short', qty, s, pos_side_BOTH = one_way_mode, reduceOnly=True)
+            raise ValueError("Position not opened properly")
+        qty_round_new = bx.count_decimal_places(qty)
+        send_alert(chat_id, f"✅ Order placed on {symbol}. Period: {signal['period']}")
+
+        # Тейк-профиты
+        resp_tps = bx.set_multiple_tp(s, qty, bx.get_mark_price(s), 'long', tp_prices, one_way_mode)
+        if resp_tps[-1].get('code') != 0 and resp_tps[0].get('code') == 0:
+            resp_tps = bx.set_multiple_tp(s, round((qty/len(tp_prices))*0.98,qty_round_new), bx.get_mark_price(s), 'long', tp_prices, one_way_mode)
+        elif any(r.get('code') != 0 for r in resp_tps):
+            retry_resp = bx.set_multiple_tp(s, round(qty * 0.985, qty_round_new), bx.get_mark_price(s), 'long', tp_prices, one_way_mode)
+            if any(r.get('code') != 0 for r in retry_resp):
+                r = bx.place_market_order('short', qty, s,pos_side_BOTH = one_way_mode, reduceOnly=True )
+                send_alert(chat_id, f"❌ TP placement failed → position closed {symbol}. {retry_resp}. Closing responce {r} ")
+                return
+
+        # Trailing
+        if user_data.get("trailing_enabled", False):
+            act_price = price_now * (1 + user_data.get("trailing_activation_pct", 1.5) / 100)
+            trail_rate = round(user_data.get("trailing_rate_pct", 0.5) / 100, 3)
+            trail_resp = bx.set_trailing(s, 'long', qty, act_price, trail_rate, one_way_mode)
+            if trail_resp.get('code') != 0:
+                logger.warning(f"Trailing failed for {chat_id} {symbol}: {trail_resp}")
+
+        logger.info(f"Trade successfully opened for {chat_id} — {symbol}")
+        
+    except Exception as e:
+        logger.error(f"Trade error {chat_id} {symbol}", e)
+        send_alert(chat_id, f"❌ Ошибка открытия сделки {symbol}: {str(e)}, {resp}")
+        try:
+            bx.place_market_order('short', qty, s, pos_side_BOTH = one_way_mode, reduceOnly=True)
+        except:
+            pass
 
 # =====================================================
 # ================== TELEGRAM HANDLERS ================
 # =====================================================
 
-# Conversation states
 (
-    API_KEY, API_SECRET, TESTNET, LEVERAGE, MARGIN, STOP_LOSS, TAKE_PROFIT,
-    TRAILING_ENABLED, TRAILING_ACTIVATION, TRAILING_RATE, TRADING_ENABLED,
-    VOLUME_MULTIPLIER
-) = range(12)
+    API_KEY, API_SECRET, TESTNET, PRICE_OI_RATIO_STATE, LEVERAGE, MARGIN, STOP_LOSS, TP_LIST,
+    TRAILING_ACTIVATION, TRAILING_RATE, VOLUME_MULTIPLIER
+) = range(11)
 
-def check_volume_filter(symbol, multiplier):
-    klines = get_klines(symbol, Vol_period)
+WELCOME_MESSAGE = """
+Добро пожаловать в OI Alert Bot v2!
+Автор: @Perpetual_god
+Канал автора по трейдингу: @crypto_maniacdt
+Курс по алготрейдингу + бонусы для рефералов: https://t.me/crypto_maniacdt/428 
 
-    if len(klines) < Vol_period:
-        return False
+Формат настроек:
+- API Key/Secret: строки из BingX
+- Leverage: целое (например 10)
+- Типы сигналов 4h/24h:  вкл/выкл
+- PRICE -> OI: число (адекватные значения менее 0.7)
+- Margin USDT: число (например 50)
+- SL %: число (например 2.0)
+- TP %: через запятую (например 4,6,8)
+- Trailing Activation %: число
+- Trailing Rate %: число
 
-    volumes = [float(k[5]) for k in klines[:-1]]  # без текущей
-    avg_volume = sum(volumes) / len(volumes)
+Фильтры:
+- Volume Filter: вкл/выкл + multiplier
+- Blacklist: /blacklist_add SYMBOL
 
-    current_volume = float(klines[-1][5])
+Число-коэффициент PRICE->OI отвечает за максимальное возможное отношение роста цены к росту OI. В виде формулы: входим если рост_ОИ*коэф > рост_цены
+Период сигналов овечает за количество свечей, по которому мы смотрим отношение роста OI к росту цены.
+4h сигналы лучшие для трейдинга, но также и по 24ч винрейт удовлетворительный.
 
-    return current_volume >= avg_volume * multiplier
+ВАЖНО: софт идеально работает с HEDGE MODE, но в v2 добавлена поддержка и one-way mode.
+
+Команды:
+/start /settings /stats /help /stop
+/blacklist_add /blacklist_remove /blacklist_show
+"""
 
 def start(update: Update, context):
     chat_id = str(update.effective_chat.id)
@@ -272,71 +413,69 @@ def start(update: Update, context):
         users[chat_id] = {
             "trading_enabled": False,
             "testnet": False,
-            "api_key": "",
-            "api_secret": "",
-            "leverage": 10,
-            "margin_usdt": 50,
-            "stop_loss_pct": 2.0,
-            "take_profit_pct": 4.0,
+            "api_key": "", "api_secret": "",
+            "leverage": 10, "margin_usdt": 50,
+            "signals_4h_enabled": True,
+            "signals_24h_enabled": True,
+            "price_oi_ratio": 0.5,
+            "stop_loss_pct": 2.0, "take_profit_pcts": [4.0, 6.0],
             "trailing_enabled": False,
-            "trailing_activation_pct": 1.5,
-            "trailing_rate_pct": 0.5,
-            "last_signal_time": {},
-
-            # === NEW ===
-            "volume_filter_enabled": False,
-            "volume_multiplier": 2.0,
-            "blacklist": []
+            "trailing_activation_pct": 1.5, "trailing_rate_pct": 0.5,
+            "volume_filter_enabled": False, "volume_multiplier": 2.0,
+            "blacklist": [], "last_signal_time": {}
         }
         save_users(users)
-    update.message.reply_text("✅ Подписка на OI-сигналы активирована. Используйте /settings для настроек.")
+
+    update.message.reply_text(WELCOME_MESSAGE)
     return show_settings_menu(update, context)
+
+def help_command(update: Update, context):
+    update.message.reply_text(WELCOME_MESSAGE)
 
 def stop(update: Update, context):
     chat_id = str(update.effective_chat.id)
     if chat_id in users:
         del users[chat_id]
         save_users(users)
-    update.message.reply_text("❌ Подписка отключена")
+    update.message.reply_text("Подписка отключена")
     return ConversationHandler.END
 
 def settings(update: Update, context):
     return show_settings_menu(update, context)
 
 def show_settings_menu(update: Update, context):
-    if update.callback_query:
-        chat_id = str(update.callback_query.message.chat_id)
-    else:
-        chat_id = str(update.effective_chat.id)
-    
-    user = users.get(chat_id, {
-        "trading_enabled": False, "testnet": False, "api_key": "", "api_secret": "",
-        "leverage": 10, "margin_usdt": 50, "stop_loss_pct": 2.0, "take_profit_pct": 4.0,
-        "trailing_enabled": False, "trailing_activation_pct": 1.5, "trailing_rate_pct": 0.5
-    })
+    chat_id = str(update.effective_chat.id if update.message else update.callback_query.message.chat_id)
+    user = users.get(chat_id, {})
 
     keyboard = [
-        [InlineKeyboardButton(f"Торговля: {'✅ Вкл' if user.get('trading_enabled') else '❌ Выкл'}", callback_data='toggle_trading')],
-        [InlineKeyboardButton(f"API Key: {'✅ Установлен' if user.get('api_key') else '❌ Не установлен'}", callback_data='set_api_key')],
-        [InlineKeyboardButton(f"API Secret: {'✅ Установлен' if user.get('api_secret') else '❌ Не установлен'}", callback_data='set_api_secret')],
-        [InlineKeyboardButton(f"Сеть: {'Testnet' if user.get('testnet') else 'Real'}", callback_data='toggle_testnet')],
-        [InlineKeyboardButton(f"Плечо: {user.get('leverage', 10)}x", callback_data='set_leverage')],
-        [InlineKeyboardButton(f"Маржа: {user.get('margin_usdt', 50)} USDT", callback_data='set_margin')],
-        [InlineKeyboardButton(f"SL: {user.get('stop_loss_pct', 2.0)}%", callback_data='set_sl')],
-        [InlineKeyboardButton(f"TP: {user.get('take_profit_pct', 4.0)}%", callback_data='set_tp')],
-        [InlineKeyboardButton(f"Трейлинг: {'✅ Вкл' if user.get('trailing_enabled') else '❌ Выкл'}", callback_data='toggle_trailing')],
-        [InlineKeyboardButton(f"Активация трейлинга: {user.get('trailing_activation_pct', 1.5)}%", callback_data='set_trail_act')],
-        [InlineKeyboardButton(f"Price Rate: {user.get('trailing_rate_pct', 0.5)}%", callback_data='set_trail_rate')],
+        [InlineKeyboardButton(f"⚙️ Торговля: {'✅' if user.get('trading_enabled') else '❌'}", callback_data='toggle_trading')],
+        [InlineKeyboardButton(f"🔑 API Key: {'✅' if user.get('api_key') else '❌'}", callback_data='set_api_key')],
+        [InlineKeyboardButton(f"🔒 API Secret: {'✅' if user.get('api_secret') else '❌'}", callback_data='set_api_secret')],
+        [InlineKeyboardButton(f"🌐 Сеть: {'Testnet' if user.get('testnet') else 'Real'}", callback_data='toggle_testnet')],
+        [InlineKeyboardButton(f"📈 Плечо: {user.get('leverage', 10)}x", callback_data='set_leverage')],
+        [InlineKeyboardButton(f"💰 Маржа: {user.get('margin_usdt', 50)} USDT", callback_data='set_margin')],
         [InlineKeyboardButton(
-            f"Volume filter: {'✅ Вкл' if user.get('volume_filter_enabled') else '❌ Выкл'}",
-            callback_data='toggle_volume_filter'
+            f"⏱ 4H сигналы: {'✅' if user.get('signals_4h_enabled', True) else '❌'}",
+            callback_data='toggle_4h'
         )],
         [InlineKeyboardButton(
-            f"Volume x{user.get('volume_multiplier', 2.0)}",
-            callback_data='set_volume_multiplier'
+            f"⏱ 24H сигналы: {'✅' if user.get('signals_24h_enabled', True) else '❌'}",
+            callback_data='toggle_24h'
         )],
+        [InlineKeyboardButton(
+            f"📐 PRICE→OI: {user.get('price_oi_ratio', 0.5)}",
+            callback_data='set_price_oi_ratio'
+        )],
+        [InlineKeyboardButton(f"🛑 SL: {user.get('stop_loss_pct', 2.0)}%", callback_data='set_sl')],
+        [InlineKeyboardButton(f"🎯 TP: {','.join(map(str, user.get('take_profit_pcts', [4,6])))}%", callback_data='set_tp_list')],
+        [InlineKeyboardButton(f"📉 Трейлинг: {'✅' if user.get('trailing_enabled') else '❌'}", callback_data='toggle_trailing')],
+        [InlineKeyboardButton(f"🚀 Активация трейлинга: {user.get('trailing_activation_pct', 1.5)}%", callback_data='set_trail_act')],
+        [InlineKeyboardButton(f"📊 Price Rate: {user.get('trailing_rate_pct', 0.5)}%", callback_data='set_trail_rate')],
+        [InlineKeyboardButton(f"🔍 Volume filter: {'✅' if user.get('volume_filter_enabled') else '❌'}", callback_data='toggle_volume_filter')],
+        [InlineKeyboardButton(f"📶 Volume x{user.get('volume_multiplier', 2.0)}", callback_data='set_volume_multiplier')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     text = "<b>⚙️ Настройки торгового бота</b>"
 
     if update.callback_query:
@@ -344,73 +483,105 @@ def show_settings_menu(update: Update, context):
             update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
             if "Message is not modified" in str(e):
-                pass  # игнорируем эту ошибку
+                pass
             else:
                 raise
     else:
         update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
-    
+
     return ConversationHandler.END
+
 def blacklist_show(update: Update, context):
     chat_id = str(update.effective_chat.id)
     blacklist = users.get(chat_id, {}).get("blacklist", [])
-
     if not blacklist:
-        update.message.reply_text("📭 Чёрный список пуст")
+        update.message.reply_text("Чёрный список пуст")
         return
-
-    text = "<b>⛔ Чёрный список:</b>\n\n"
-    text += "\n".join(f"• {s}" for s in sorted(blacklist))
-
+    text = "<b>Чёрный список:</b>\n\n" + "\n".join(f"• {s}" for s in sorted(blacklist))
     update.message.reply_text(text, parse_mode="HTML")
+
 def button_handler(update: Update, context):
     query = update.callback_query
-    query.answer()  # Обязательно отвечаем на callback!
+    query.answer()
     chat_id = str(query.message.chat_id)
     data = query.data
 
     if data == 'toggle_trading':
         users[chat_id]['trading_enabled'] = not users[chat_id].get('trading_enabled', False)
-        save_users(users)
-
     elif data == 'toggle_testnet':
         users[chat_id]['testnet'] = not users[chat_id].get('testnet', False)
-        save_users(users)
-
     elif data == 'toggle_trailing':
         users[chat_id]['trailing_enabled'] = not users[chat_id].get('trailing_enabled', False)
-        save_users(users)
-    elif data == 'set_volume_multiplier':
-        context.user_data['setting'] = 'set_volume_multiplier'
-        query.edit_message_text("Введите volume multiplier (например 2.0):")
-        return VOLUME_MULTIPLIER
-    elif data.startswith('set_'):
-        context.user_data['setting'] = data
-        field_name = data.replace('set_', '').replace('_', ' ').title()
-        query.edit_message_text(f"Введите новое значение для <b>{field_name}</b>:", parse_mode="HTML")
-        return get_state(data)
     elif data == 'toggle_volume_filter':
         users[chat_id]['volume_filter_enabled'] = not users[chat_id].get('volume_filter_enabled', False)
-        save_users(users)
+    elif data.startswith('set_'):
+        context.user_data['setting'] = data
+        field = data.replace('set_', '').replace('_', ' ').title()
+        query.edit_message_text(f"Введите новое значение для <b>{field}</b>:", parse_mode="HTML")
+        return get_state(data)
+    elif data == 'toggle_4h':
+        users[chat_id]['signals_4h_enabled'] = not users[chat_id].get('signals_4h_enabled', True)
 
-    
-    # Если мы здесь — значит, была toggle-операция, обновляем меню
-    show_settings_menu(update, context)
-    return ConversationHandler.END
+    elif data == 'toggle_24h':
+        users[chat_id]['signals_24h_enabled'] = not users[chat_id].get('signals_24h_enabled', True)
 
-def get_state(data):
-    map = {
+    elif data == 'set_price_oi_ratio':
+        context.user_data['setting'] = 'set_price_oi_ratio'
+        query.edit_message_text(
+            "Введите коэффициент PRICE → OI (например 0.5):"
+        )
+        return PRICE_OI_RATIO_STATE
+
+    save_users(users)
+    return show_settings_menu(update, context)
+
+def get_state(data: str) -> int:
+    mapping = {
         'set_api_key': API_KEY,
         'set_api_secret': API_SECRET,
         'set_leverage': LEVERAGE,
         'set_margin': MARGIN,
         'set_sl': STOP_LOSS,
-        'set_tp': TAKE_PROFIT,
+        'set_tp_list': TP_LIST,
         'set_trail_act': TRAILING_ACTIVATION,
         'set_trail_rate': TRAILING_RATE,
-        'set_volume_multiplier': VOLUME_MULTIPLIER,  # ← ВАЖНО
+        'set_volume_multiplier': VOLUME_MULTIPLIER,
+        'set_price_oi_ratio': PRICE_OI_RATIO_STATE,  
     }
-    return map.get(data, ConversationHandler.END)
+    return mapping.get(data, ConversationHandler.END)
+
+def set_value(update: Update, context, key: str, type_func):
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id not in users:
+        users[chat_id] = {
+            "trading_enabled": False,
+            "testnet": False,
+            "api_key": "", "api_secret": "",
+            "leverage": 10, "margin_usdt": 50,
+            "stop_loss_pct": 2.0, "take_profit_pcts": [4.0, 6.0],
+            "trailing_enabled": False,
+            "trailing_activation_pct": 1.5, "trailing_rate_pct": 0.5,
+            "volume_filter_enabled": False, "volume_multiplier": 2.0,
+            "blacklist": [], "last_signal_time": {},
+            "signals_4h_enabled": True,
+            "signals_24h_enabled": True,
+            "price_oi_ratio": 0.5
+        }
+        save_users(users)
+        logger.info(f"Новый пользователь добавлен автоматически: {chat_id}")
+
+    text = update.message.text.strip()
+    try:
+        value = type_func(text)
+        users[chat_id][key] = value
+        save_users(users)
+        update.message.reply_text(f"{key.replace('_', ' ').title()} установлен: {value}")
+    except ValueError:
+        update.message.reply_text("Неверный формат. Попробуйте снова.")
+        return get_state(context.user_data.get('setting', ''))
+
+    return show_settings_menu(update, context)
 
 def set_api_key(update: Update, context):
     return set_value(update, context, 'api_key', str)
@@ -427,9 +598,6 @@ def set_margin(update: Update, context):
 def set_sl(update: Update, context):
     return set_value(update, context, 'stop_loss_pct', float)
 
-def set_tp(update: Update, context):
-    return set_value(update, context, 'take_profit_pct', float)
-
 def set_trail_act(update: Update, context):
     return set_value(update, context, 'trailing_activation_pct', float)
 
@@ -439,62 +607,91 @@ def set_trail_rate(update: Update, context):
 def set_volume_multiplier(update: Update, context):
     return set_value(update, context, 'volume_multiplier', float)
 
-def blacklist_add(update: Update, context):
+def set_tp_list(update: Update, context):
     chat_id = str(update.effective_chat.id)
+    try:
+        tp_list = [float(x) for x in update.message.text.replace(' ', '').split(',')]
+        if not tp_list or any(x <= 0 for x in tp_list):
+            raise ValueError
+        users[chat_id]['take_profit_pcts'] = tp_list
+        save_users(users)
+        update.message.reply_text(f"Take Profits: {tp_list}%")
+    except:
+        update.message.reply_text("Формат: 4,6,8")
+        return TP_LIST
+    return show_settings_menu(update, context)
 
+def blacklist_add(update: Update, context):
     if not context.args:
         update.message.reply_text("Использование: /blacklist_add BTCUSDT")
         return
-
     symbol = context.args[0].upper()
-
-    users[chat_id].setdefault("blacklist", [])
+    chat_id = str(update.effective_chat.id)
+    users.setdefault(chat_id, {})["blacklist"] = users[chat_id].get("blacklist", [])
     if symbol not in users[chat_id]["blacklist"]:
         users[chat_id]["blacklist"].append(symbol)
         save_users(users)
-
-    update.message.reply_text(f"⛔ {symbol} добавлен в чёрный список")
+    update.message.reply_text(f"{symbol} добавлен в чёрный список")
 
 def blacklist_remove(update: Update, context):
-    chat_id = str(update.effective_chat.id)
-
     if not context.args:
         update.message.reply_text("Использование: /blacklist_remove BTCUSDT")
         return
-
     symbol = context.args[0].upper()
-
-    if symbol in users[chat_id].get("blacklist", []):
+    chat_id = str(update.effective_chat.id)
+    if symbol in users.get(chat_id, {}).get("blacklist", []):
         users[chat_id]["blacklist"].remove(symbol)
         save_users(users)
+    update.message.reply_text(f"{symbol} удалён из чёрного списка")
 
-    update.message.reply_text(f"✅ {symbol} удалён из чёрного списка")
-    
-    
-def set_value(update: Update, context, key, type_func=str):
+def stats(update: Update, context):
     chat_id = str(update.effective_chat.id)
-    text = update.message.text.strip()
-    
+    user_data = users.get(chat_id)
+    if not user_data or not user_data.get("api_key"):
+        update.message.reply_text("API не настроен")
+        return
+
     try:
-        if type_func == bool:
-            value = text.lower() in ['true', '1', 'yes', 'да', 'вкл']
-        else:
-            value = type_func(text)
-        users[chat_id][key] = value
-        save_users(users)
-        update.message.reply_text(f"✅ {key.replace('_', ' ').title()} установлен: {value}")
-    except ValueError:
-        update.message.reply_text("❌ Неверный формат. Попробуйте снова.")
-        # Остаёмся в текущем состоянии ввода
-        return get_state(context.user_data['setting'])
-    
-    # Успешно — выходим из ввода и показываем меню
-    show_settings_menu(update, context)
-    return ConversationHandler.END
+        bx = BingxClient(user_data["api_key"], user_data["api_secret"], user_data.get("testnet", False))
+        positions = bx.get_positions()
+        open_pos = [p for p in positions if abs(float(p.get('positionAmt', 0))) > 0]
+        unrealized = sum(float(p.get('unrealizedProfit', 0)) for p in open_pos)
+
+        trades = bx.get_trades_history(days=1)
+        closed = [t for t in trades if t.get("incomeType") == "REALIZED_PNL"]
+        realized_24h = sum(float(t.get('income', 0)) for t in closed)
+
+        text = (
+            f"Статистика:\n\n"
+            f"Открытых позиций: {len(open_pos)}\n"
+            f"Нереализованный PnL: {unrealized:.2f} USDT\n\n"
+            f"За 24ч:\n"
+            f"Закрыто сделок: {len(closed)}\n"
+            f"Реализованный PnL: {realized_24h:.2f} USDT"
+        )
+        update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Stats error {chat_id}: {e}")
+        update.message.reply_text(f"Ошибка: {e}")
 
 # =====================================================
 # ================== MAIN LOOP ========================
 # =====================================================
+def set_price_oi_ratio(update: Update, context):
+    chat_id = str(update.effective_chat.id)
+    try:
+        value = float(update.message.text)
+        if not (0 < value <= 2):
+            raise ValueError
+        users[chat_id]['price_oi_ratio'] = value
+        save_users(users)
+        update.message.reply_text(f"PRICE → OI коэффициент установлен: {value}")
+    except:
+        update.message.reply_text("Введите число, например 0.5")
+        return PRICE_OI_RATIO_STATE
+
+    return show_settings_menu(update, context)
+
 
 def telegram_bot():
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
@@ -504,6 +701,7 @@ def telegram_bot():
         entry_points=[
             CommandHandler('start', start),
             CommandHandler('settings', settings),
+            CommandHandler('help', help_command),
             CallbackQueryHandler(button_handler)
         ],
         states={
@@ -512,35 +710,56 @@ def telegram_bot():
             LEVERAGE: [MessageHandler(Filters.text & ~Filters.command, set_leverage)],
             MARGIN: [MessageHandler(Filters.text & ~Filters.command, set_margin)],
             STOP_LOSS: [MessageHandler(Filters.text & ~Filters.command, set_sl)],
-            TAKE_PROFIT: [MessageHandler(Filters.text & ~Filters.command, set_tp)],
+            TP_LIST: [MessageHandler(Filters.text & ~Filters.command, set_tp_list)],
             TRAILING_ACTIVATION: [MessageHandler(Filters.text & ~Filters.command, set_trail_act)],
             TRAILING_RATE: [MessageHandler(Filters.text & ~Filters.command, set_trail_rate)],
-            VOLUME_MULTIPLIER: [MessageHandler(Filters.text & ~Filters.command, set_volume_multiplier)]
+            VOLUME_MULTIPLIER: [MessageHandler(Filters.text & ~Filters.command, set_volume_multiplier)],
+            PRICE_OI_RATIO_STATE: [MessageHandler(Filters.text & ~Filters.command, set_price_oi_ratio)],
         },
         fallbacks=[],
+        per_message=False,  
     )
+
     dp.add_handler(CommandHandler("blacklist_add", blacklist_add))
     dp.add_handler(CommandHandler("blacklist_show", blacklist_show))
     dp.add_handler(CommandHandler("blacklist_remove", blacklist_remove))
+    dp.add_handler(CommandHandler("stats", stats))
     dp.add_handler(conv_handler)
     dp.add_handler(CommandHandler("stop", stop))
 
+    # Установка списка команд для / в Telegram
+    commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("settings", "Настройки"),
+        BotCommand("stats", "Статистика позиций"),
+        BotCommand("help", "Помощь"),
+        BotCommand("stop", "Отписаться"),
+        BotCommand("blacklist_add", "Добавить в blacklist"),
+        BotCommand("blacklist_remove", "Удалить из blacklist"),
+        BotCommand("blacklist_show", "Показать blacklist"),
+    ]
+    bot.set_my_commands(commands)
+
     updater.start_polling()
 
-import threading
+# Запуск Telegram-бота в отдельном потоке
 threading.Thread(target=telegram_bot, daemon=True).start()
 
 def main():
     symbols = get_symbols()
-    print(f"[INFO] Symbols loaded: {len(symbols)}")
+    logger.info(f"Loaded {len(symbols)} perpetual symbols")
 
     while True:
         start_time = time.time()
-        print(f"[INFO] Scan started {datetime.utcnow()}")
+        logger.info("Scan started")
 
-        for symbol in symbols:
-            check_symbol(symbol)
-            time.sleep(0.15)  # rate limit protection
+        signals = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(check_symbol, s): s for s in symbols}
+            for future in concurrent.futures.as_completed(futures):
+                signal = future.result()
+                if signal:
+                    signals.append(signal)
 
         elapsed = time.time() - start_time
         sleep_time = max(60, CHECK_INTERVAL_MIN * 60 - elapsed)
