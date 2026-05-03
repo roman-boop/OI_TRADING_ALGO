@@ -4,8 +4,8 @@ from datetime import datetime
 from collections import defaultdict
 
 from bingx_client import BingxClient
-APIKEY = 'SnOOQDiwELC2WIvhzNU8zFrbZ2ul6OrUPQ9s9MGVHv7vOCi6JJb80F0mVsBkxV7NlyoQQ0arb7C1fP6j3Q'
-APISECRET = 'RhcxYAQKO9lnMrcg8ZM85ehPEY3sUelrp6oQDYhiEE6dgoclrk4gQNQnqao0iJtyj2fBpn7KaDBaxydxjY2Q'
+APIKEY = ''
+APISECRET = ''
 bx = BingxClient(APIKEY, APISECRET)
 # =====================================================
 # ================== CONFIG ===========================
