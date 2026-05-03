@@ -1,14 +1,13 @@
-# bingx_client.py (updated)
-
 import time, hmac, hashlib, requests, json
 
 
 class BingxClient:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+    BASE_URL = "https://open-api-vst.bingx.com"
+
+    def __init__(self, api_key: str, api_secret: str, symbol: str = None):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.testnet = testnet
-        self.BASE_URL = "https://open-api-vst.bingx.com" if testnet else "https://open-api.bingx.com"
+        self.symbol = self._to_bingx_symbol(symbol) if symbol else None
         self.time_offset = self.get_server_time_offset()
 
     def _to_bingx_symbol(self, symbol: str) -> str:
@@ -19,6 +18,7 @@ class BingxClient:
                         query.encode("utf-8"),
                         hashlib.sha256).hexdigest()
 
+    
     def parseParam(self, paramsMap: dict) -> str:
         sortedKeys = sorted(paramsMap)
         paramsStr = "&".join(f"{k}={paramsMap[k]}" for k in sortedKeys)
@@ -27,14 +27,14 @@ class BingxClient:
             return f"{paramsStr}&timestamp={timestamp}"
         else:
             return f"timestamp={timestamp}"
-
+    APIURL = "https://open-api-vst.bingx.com"
     def send_request(self, method: str, path: str, urlpa: str, payload: dict):
         sign = self._sign(urlpa)
-        url = f"{self.BASE_URL}{path}?{urlpa}&signature={sign}"
+        url = f"{self.APIURL}{path}?{urlpa}&signature={sign}"
         headers = {'X-BX-APIKEY': self.api_key}
         response = requests.request(method, url, headers=headers, data=payload)
         try:
-            return response.json()
+            return response.json()  # ← сразу возвращаем dict
         except Exception as e:
             print("Ошибка при парсинге JSON:", e)
             print("Ответ сервера:", response.text)
@@ -59,41 +59,45 @@ class BingxClient:
         return r.json()
 
     def get_server_time_offset(self):
-        path = "/openApi/swap/v2/server/time"
-        data = self._public_request(path)
+        url = f"{self.BASE_URL}/openApi/swap/v2/server/time"
+        r = requests.get(url)
+        r.raise_for_status()
+        data = r.json()
         if data.get("code") == 0:
             server_time = int(data["data"]["serverTime"])
             local_time = int(time.time() * 1000)
             return server_time - local_time
         return 0
 
-    def get_mark_price(self, symbol=None):
-        path = "/openApi/swap/v2/quote/premiumIndex"
-        s = self._to_bingx_symbol(symbol) if symbol else self.symbol
-        params = {'symbol': s}
-        try:
-            data = self._public_request(path, params)
-            if data.get('code') == 0 and 'data' in data:
-                if isinstance(data['data'], list) and len(data['data']) > 0:
-                    mark_price = data['data'][0].get('markPrice')
-                    return float(mark_price) if mark_price is not None else None
-                elif isinstance(data['data'], dict):
-                    mark_price = data['data'].get('markPrice')
-                    return float(mark_price) if mark_price is not None else None
-            return None
-        except Exception as e:
-            return None
+    # ============= Полезные методы =============
 
-    def place_market_order(self, side: str, qty: float, symbol: str = None, stop: float = None, tp: float = None, pos_side_BOTH: bool = False):
+    def get_mark_price(self, symbol=None):
+            path = "/openApi/swap/v2/quote/premiumIndex"
+            s = symbol or self.symbol
+            params = {'symbol': s}
+            try:
+                data = self._public_request(path, params)
+                if data.get('code') == 0 and 'data' in data:
+                    # проверяем, что data это список
+                    if isinstance(data['data'], list) and len(data['data']) > 0:
+                        mark_price = data['data'][0].get('markPrice')
+                        return float(mark_price) if mark_price is not None else None
+                    elif isinstance(data['data'], dict):
+                        mark_price = data['data'].get('markPrice')
+                        return float(mark_price) if mark_price is not None else None
+                return None
+            except Exception as e:
+                return None
+
+
+    def place_market_order(self, side: str, qty: float, symbol: str = None, stop: float = None, tp: float = None):
         side_param = "BUY" if side == "long" else "SELL"
         s = symbol or self.symbol
-        pos_side = "LONG" if side == "long" else "SHORT"
-        if pos_side_BOTH == True:
-            pos_side = 'BOTH'
+
         params = {
             "symbol": s,
             "side": side_param,
-            "positionSide": pos_side,
+            "positionSide": "BOTH",
             "type": "MARKET",
             "timestamp": int(time.time()*1000) + self.get_server_time_offset(),
             "quantity": qty,
@@ -124,21 +128,12 @@ class BingxClient:
         return self._request("POST", "/openApi/swap/v2/trade/order", params)
 
     def count_decimal_places(self, number: float) -> int:
+        # Преобразуем число в строку с удалением лишних нулей после запятой
         s = str(number).rstrip('0')  
         if '.' in s:
             return len(s.split('.')[1])
         else:
             return 0
-        
-    def set_leverage(self, symbol: str, side: str, leverage: int):
-        params = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "leverage": leverage,
-            "timestamp": int(time.time() * 1000) + self.time_offset
-        }
-        return self._request("POST", "/openApi/swap/v2/trade/leverage", params)
-    
     def set_multiple_sl(self, symbol: str, qty: float, entry_price: float, side: str, sl_levels):
         precision = self.count_decimal_places(entry_price)
 
@@ -222,19 +217,3 @@ class BingxClient:
         
     
         return answer
-
-    def set_trailing(self, symbol, side: str, qty: float, activation_price: float, priceRate: float):
-        params = {
-            "symbol": symbol,
-            "side": 'SELL' if side == 'long' else 'BUY',
-            "positionSide": "LONG" if side =='long' else 'SHORT',
-            "type": "TRAILING_TP_SL",
-            "timestamp": int(time.time() * 1000) + self.time_offset,
-            "quantity": qty,
-            "recvWindow": 5000,
-            'workingType': 'CONTRACT_PRICE',
-            'activationPrice': activation_price,
-            "newClientOrderId": "",
-            'priceRate': priceRate,
-        }
-        return self._request("POST", "/openApi/swap/v2/trade/order", params)
